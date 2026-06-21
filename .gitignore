@@ -19,3 +19,5 @@ kafka-data/
 
 # Logs
 *.log
+postgres_data/
+postgres_server.log
