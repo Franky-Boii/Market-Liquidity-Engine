@@ -1,0 +1,21 @@
+# Target build directories
+target/
+*.jar
+*.war
+*.ear
+
+# IDE and System files
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+.DS_Store
+
+# Local Environment / Database Data
+.env
+postgres-data/
+kafka-data/
+
+# Logs
+*.log
