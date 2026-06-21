@@ -21,3 +21,4 @@ kafka-data/
 *.log
 postgres_data/
 postgres_server.log
+env/
