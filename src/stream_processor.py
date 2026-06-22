@@ -1,44 +1,58 @@
-import collections
-import time
+import numpy as np
 
 class MarketStreamProcessor:
-    def __init__(self, window_size=100, volatility_multiplier=2.0):
-        # Sliding window buffer to track recent ticks
-        self.tick_window = collections.deque(maxlen=window_size)
-        self.volatility_multiplier = volatility_multiplier
+    def __init__(self, window_size=30, z_score_threshold=2.5):
+        self.window_size = window_size
+        self.threshold = z_score_threshold
+        # Maintain separate rolling memory buffers for our monitored asset nodes
+        self.buffers = {}
 
-    def process_tick(self, tick_data):
-        """
-        Ingests a raw market tick and applies streaming metrics on the fly.
-        """
+    def process_tick(self, tick):
         try:
-            price = float(tick_data['c'])
-            volume = float(tick_data['v'])
-            timestamp = tick_data['E']
-            symbol = tick_data['s']
-        except (KeyError, ValueError) as e:
+            symbol = tick.get("s") # Asset symbol (e.g., BTCUSDT)
+            price = float(tick.get("c")) # Current close price
+            volume = float(tick.get("v")) # Traded volume chunk
+            timestamp = int(tick.get("E")) # System event epoch time
+
+            if symbol not in self.buffers:
+                self.buffers[symbol] = {"prices": [], "volumes": []}
+
+            # Append fresh telemetry into our tracking arrays
+            self.buffers[symbol]["prices"].append(price)
+            self.buffers[symbol]["volumes"].append(volume)
+
+            # Enforce sliding memory window boundary limits
+            if len(self.buffers[symbol]["prices"]) > self.window_size:
+                self.buffers[symbol]["prices"].pop(0)
+                self.buffers[symbol]["volumes"].pop(0)
+
+            # Convert sliding lists directly to high-performance NumPy arrays
+            price_array = np.array(self.buffers[symbol]["prices"])
+            volume_array = np.array(self.buffers[symbol]["volumes"])
+
+            # Vectorized VWAP: sum(Price * Volume) / sum(Volume)
+            vwap = np.sum(price_array * volume_array) / np.sum(volume_array)
+
+            # NumPy Dynamic Vector Math Model: Rolling Volatility Standard Deviation Z-Score
+            market_state = "NORMAL"
+            if len(price_array) >= 5:
+                mean_price = np.mean(price_array)
+                std_price = np.std(price_array)
+                
+                if std_price > 0:
+                    # Calculate how many standard deviations the current tick is from the mean
+                    z_score = np.abs(price - mean_price) / std_price
+                    if z_score > self.threshold:
+                        market_state = "LIQUIDITY_SPIKE"
+
+            return {
+                "timestamp": timestamp,
+                "symbol": symbol,
+                "price": price,
+                "volume": volume,
+                "vwap": round(float(vwap), 2),
+                "alert": market_state
+            }
+        except Exception as e:
+            print(f"Mathematical processing anomaly: {e}")
             return None
-
-        # Append current tick to our moving window
-        self.tick_window.append((price, volume))
-
-        # Calculate Rolling VWAP: Sum(Price * Volume) / Sum(Volume)
-        total_pv = sum(p * v for p, v in self.tick_window)
-        total_volume = sum(v for p, v in self.tick_window)
-        vwap = total_pv / total_volume if total_volume > 0 else price
-
-        # Detect Volatility Spikes: Flag if current volume is significantly higher than the window average
-        avg_volume = total_volume / len(self.tick_window)
-        is_volatility_spike = len(self.tick_window) > 10 and volume > (avg_volume * self.volatility_multiplier)
-
-        # Structure out our enriched, processed analytical package
-        analytics_payload = {
-            "timestamp": timestamp,
-            "symbol": symbol,
-            "price": price,
-            "volume": volume,
-            "vwap": round(vwap, 2),
-            "alert": "LIQUIDITY_SPIKE" if is_volatility_spike else "NORMAL"
-        }
-
-        return analytics_payload

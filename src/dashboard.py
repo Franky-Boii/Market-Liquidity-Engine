@@ -1,10 +1,12 @@
 import streamlit as st
 import psycopg2
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
+from scipy.stats import norm
 import time
 import warnings
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dt_time
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -22,39 +24,35 @@ selected_market = st.sidebar.selectbox(
 
 chart_style = st.sidebar.radio(
     "Select Visual Representation",
-    ["Standard Line Chart", "Financial Candlestick", "Standalone Volume Histogram"]
+    ["Standard Line Chart", "Financial Candlestick", "NumPy Volatility Distribution Graph"]
 )
 
 time_frame = st.sidebar.radio(
     "Historical Looking Window Preset",
-    ["Live Stream (Default)", "Past 24 Hours", "Past 7 Days", "Custom Date Range"]
+    ["Live Stream (Default)", "Precision Custom Time Boundary"]
 )
 
+# Initialize boundary metrics
 start_time_ms = 0
 end_time_ms = int(time.time() * 1000)
 
-if time_frame == "Past 24 Hours":
-    start_time_ms = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
-elif time_frame == "Past 7 Days":
-    start_time_ms = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
-elif time_frame == "Custom Date Range":
-    date_bounds = st.sidebar.date_input(
-        "Select Active Boundaries",
-        value=(date.today() - timedelta(days=90), date.today())
-    )
-    if isinstance(date_bounds, tuple) and len(date_bounds) == 2:
-        start_time_ms = int(datetime.combine(date_bounds[0], datetime.min.time()).timestamp() * 1000)
-        end_time_ms = int(datetime.combine(date_bounds[1], datetime.max.time()).timestamp() * 1000)
-
-# ─── INTELLIGENT TIME-SERIES RESAMPLING AUTOSCALER ───
-is_live = (time_frame == "Live Stream (Default)")
-
-if is_live:
-    candle_interval = "1Min"  # Dense 1-minute blocks for live streams
-elif time_frame == "Past 24 Hours":
-    candle_interval = "1H"    # 1-hour blocks for past day
-else:
-    candle_interval = "1D"    # 1-day blocks for macro history view (Past 7 Days / Custom)
+# Perfect Date & Time Filter Implementation
+if time_frame == "Precision Custom Time Boundary":
+    st.sidebar.subheader("📅 Precise Date-Time Anchors")
+    
+    col_d1, col_d2 = st.sidebar.columns(2)
+    start_date = col_d1.date_input("Start Date", date.today() - timedelta(days=3))
+    end_date = col_d2.date_input("End Date", date.today())
+    
+    start_hour, start_min = st.sidebar.slider("Start Time Window", 0, 23, 0), st.sidebar.slider("Start Minute", 0, 59, 0)
+    end_hour, end_min = st.sidebar.slider("End Time Window", 0, 23, 23), st.sidebar.slider("End Minute", 0, 59, 59)
+    
+    # Compile inputs into precise datetime timestamps
+    dt_start = datetime.combine(start_date, dt_time(start_hour, start_min))
+    dt_end = datetime.combine(end_date, dt_time(end_hour, end_min))
+    
+    start_time_ms = int(dt_start.timestamp() * 1000)
+    end_time_ms = int(dt_end.timestamp() * 1000)
 
 def fetch_filtered_data(symbol, start_ms, end_ms, use_live_limit=False):
     conn = psycopg2.connect(
@@ -64,7 +62,7 @@ def fetch_filtered_data(symbol, start_ms, end_ms, use_live_limit=False):
         query = """
         SELECT timestamp, symbol, price, volume, vwap, market_state 
         FROM asset_telemetry 
-        WHERE symbol = %s ORDER BY timestamp DESC LIMIT 500;
+        WHERE symbol = %s ORDER BY timestamp DESC LIMIT 400;
         """
         df = pd.read_sql(query, conn, params=(symbol,))
     else:
@@ -85,6 +83,7 @@ def fetch_filtered_data(symbol, start_ms, end_ms, use_live_limit=False):
     return pd.DataFrame()
 
 try:
+    is_live = (time_frame == "Live Stream (Default)")
     df = fetch_filtered_data(selected_market, start_time_ms, end_time_ms, use_live_limit=is_live)
     
     if not df.empty:
@@ -95,35 +94,24 @@ try:
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Active Node Anchor", latest['symbol'])
         col2.metric("Current Value", f"${latest['price']:,.2f}")
-        col3.metric("Volume VWAP Anchor", f"${latest['vwap']:,.2f}")
+        col3.metric("Vector VWAP Anchor", f"${latest['vwap']:,.2f}")
         col4.metric("Anomalies Flagged", len(alerts_df))
         
         fig = go.Figure()
         
+        # ─── VISUAL RENDER ROUTER ───
         if chart_style == "Standard Line Chart":
-            fig.add_trace(go.Scatter(x=df['time'], y=df['price'], name='Price', line=dict(color='#2962FF', width=2)))
-            fig.add_trace(go.Scatter(x=df['time'], y=df['vwap'], name='Rolling VWAP', line=dict(color='#FF9800', width=1.5, dash='dash')))
-            if not alerts_df.empty:
-                fig.add_trace(go.Scatter(x=alerts_df['time'], y=alerts_df['price'], mode='markers', name='Liquidity Spike', marker=dict(color='#F44336', size=11, symbol='triangle-up')))
+            fig.add_trace(go.Scatter(x=df['time'], y=df['price'], name='Price Path', line=dict(color='#2962FF', width=2)))
+            fig.add_trace(go.Scatter(x=df['time'], y=df['vwap'], name='Rolling Vector VWAP', line=dict(color='#FF9800', width=1.5, dash='dash')))
             fig.update_layout(yaxis_title="Asset Valuation ($)")
 
         elif chart_style == "Financial Candlestick":
-            # Dynamic processing step to prevent pixel-squashing
             df_candlestick = df.copy()
             df_candlestick.set_index('time', inplace=True)
-            
-            # If we're looking at historical backfills, compute daily OHLC anchors dynamically
-            if not is_live and time_frame in ["Past 7 Days", "Custom Date Range"]:
-                # To simulate candles from daily seeds, we add minor asset spreads
-                ohlc = df_candlestick['price'].resample('1D').ohlc()
-                volume_resampled = df_candlestick['volume'].resample('1D').sum()
-                vwap_resampled = df_candlestick['vwap'].resample('1D').mean()
-            else:
-                ohlc = df_candlestick['price'].resample(candle_interval).ohlc()
-                volume_resampled = df_candlestick['volume'].resample(candle_interval).sum()
-                vwap_resampled = df_candlestick['vwap'].resample(candle_interval).mean()
-                
-            ohlc = ohlc.join(volume_resampled).join(vwap_resampled).dropna().reset_index()
+            interval = "1Min" if is_live else "1D"
+            ohlc = df_candlestick['price'].resample(interval).ohlc()
+            volume_resampled = df_candlestick['volume'].resample(interval).sum()
+            ohlc = ohlc.join(volume_resampled).dropna().reset_index()
             
             fig.add_trace(go.Candlestick(
                 x=ohlc['time'], open=ohlc['open'], high=ohlc['high'], low=ohlc['low'], close=ohlc['close'],
@@ -131,28 +119,45 @@ try:
                 increasing=dict(fillcolor='#089981', line=dict(color='#089981', width=1.5)),
                 decreasing=dict(fillcolor='#F23645', line=dict(color='#F23645', width=1.5))
             ))
-            fig.add_trace(go.Scatter(x=ohlc['time'], y=ohlc['vwap'], name='Interval VWAP', line=dict(color='#FF9800', width=1.5)))
             fig.update_layout(xaxis_rangeslider_visible=False, yaxis_title="Candle Valuation ($)")
 
-        elif chart_style == "Standalone Volume Histogram":
-            colors = ['#089981' if x == 'NORMAL' else '#F23645' for x in df['market_state']]
-            fig.add_trace(go.Bar(x=df['time'], y=df['volume'], name='Transacted Volume', marker_color=colors))
-            fig.update_layout(yaxis_title="Volume Metrics (Tokens)")
+        elif chart_style == "NumPy Volatility Distribution Graph":
+            # NumPy Processing: Compute log returns to model market volatility distribution
+            prices = df['price'].to_numpy()
+            if len(prices) > 2:
+                log_returns = np.diff(np.log(prices))
+                
+                # Render empirical data distribution histogram bars
+                fig.add_trace(go.Histogram(
+                    x=log_returns, nbinsx=40, name='Empirical Returns Density',
+                    histnorm='probability density', marker_color='#2962FF', opacity=0.65
+                ))
+                
+                # NumPy Model Evaluation: Overlap ideal Gaussian normal bell curve
+                x_axis_line = np.linspace(np.min(log_returns), np.max(log_returns), 200)
+                mean, std = np.mean(log_returns), np.std(log_returns)
+                if std > 0:
+                    y_axis_line = norm.pdf(x_axis_line, mean, std)
+                    fig.add_trace(go.Scatter(
+                        x=x_axis_line, y=y_axis_line, name='Gaussian Normal Curve Model',
+                        line=dict(color='#FF9800', width=2.5)
+                    ))
+                fig.update_layout(yaxis_title="Probability Density Frequency", xaxis_title="Log Return Shifts")
+            else:
+                st.info("Gathering additional market nodes to generate distribution metrics...")
 
         fig.update_layout(
-            title=f"{chart_style} ({candle_interval} Interval) Matrix: {selected_market}",
-            template="plotly_dark", xaxis_title="System Execution Timeline",
-            height=580, margin=dict(l=20, r=20, t=40, b=20),
+            title=f"{chart_style} Workspace Matrix: {selected_market}",
+            template="plotly_dark", height=580, margin=dict(l=20, r=20, t=40, b=20),
             paper_bgcolor='#131722', plot_bgcolor='#131722',
             xaxis=dict(gridcolor='#1f222e'), yaxis=dict(gridcolor='#1f222e')
         )
-        
         st.plotly_chart(fig, width="stretch", key="market_chart_node")
         
         st.subheader("Granular Transmission Log Index")
         st.dataframe(df[['time', 'price', 'volume', 'vwap', 'market_state']].tail(15), width="stretch", key="data_grid_node")
     else:
-        st.warning(f"🔍 No logged telemetry data found for {selected_market} within the selected timeframe.")
+        st.warning(f"🔍 No logged telemetry data found for {selected_market} within the selected date-time boundaries.")
 
     if is_live:
         time.sleep(1)
